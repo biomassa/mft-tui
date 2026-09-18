@@ -1,0 +1,1075 @@
+// Package ui is the Bubble Tea interface: a colour bank grid for picking a
+// knob range and an editor table that applies any number of settings to it.
+package ui
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	"github.com/charmbracelet/bubbles/textinput"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/biomassa/mft-tui/internal/mft"
+)
+
+type focus int
+
+const (
+	fGrid focus = iota
+	fFrom
+	fTo
+	fTable
+	fApply
+	numFocus
+)
+
+type screen int
+
+const (
+	sMain screen = iota
+	sGlobals
+	sPath    // open/save path prompt
+	sConfirm // y/n question
+)
+
+type mode int
+
+const (
+	keep mode = iota // don't touch this setting
+	same             // one value for the whole range
+	seq              // start + i*step
+)
+
+var modeNames = []string{"keep", "same", "sequence"}
+
+// Table columns.
+const (
+	cMode = iota
+	cValue
+	cStep
+)
+
+type row struct {
+	mode      mode
+	val, step textinput.Model
+	choice    int // Enum/Bool value
+}
+
+type Model struct {
+	preset *mft.Preset
+	base   *mft.Preset // last state read from / written to the device
+	path   string
+
+	dev  *mft.Device
+	info mft.Info
+
+	bank, cursor, anchor int // cursor/anchor are slots (1-based); anchor 0 = single knob
+	focus                focus
+	from, to             textinput.Model
+	rows                 []row
+	row, col             int
+	fresh                bool // next digit replaces the focused field's content
+
+	screen    screen
+	globalIdx int
+	pathInput textinput.Model
+	pathSave  bool
+	question  string
+	onYes     func(Model) (Model, tea.Cmd)
+	status    string
+	busy      bool
+}
+
+func numInput() textinput.Model {
+	t := textinput.New()
+	t.Prompt = ""
+	t.CharLimit = 4
+	t.Width = 4
+	return t
+}
+
+func New(preset *mft.Preset, path string) Model {
+	m := Model{preset: preset, path: path, cursor: 1, from: numInput(), to: numInput()}
+	for range mft.EncoderFields {
+		r := row{val: numInput(), step: numInput()}
+		r.step.SetValue("1")
+		m.rows = append(m.rows, r)
+	}
+	m.pathInput = textinput.New()
+	m.pathInput.Width = 70
+	m.selectionChanged()
+	if preset == nil {
+		m.status = "No preset loaded: ctrl+r reads the device, ctrl+o opens a file"
+	}
+	return m
+}
+
+// Init reads the device when no file was given.
+func (m Model) Init() tea.Cmd {
+	if m.preset == nil {
+		return readCmd(m.dev)
+	}
+	return nil
+}
+
+// ---- background work ----
+
+type readMsg struct {
+	dev    *mft.Device
+	info   mft.Info
+	preset *mft.Preset
+	err    error
+}
+
+type writtenMsg struct {
+	n   int
+	err error
+}
+
+func readCmd(dev *mft.Device) tea.Cmd {
+	return func() tea.Msg {
+		var err error
+		if dev == nil {
+			if dev, err = mft.Open(); err != nil {
+				return readMsg{err: err}
+			}
+		}
+		info, err := dev.Info()
+		if err != nil {
+			return readMsg{dev: dev, err: err}
+		}
+		p, err := dev.PullPreset(info.Banks*16, nil)
+		return readMsg{dev: dev, info: info, preset: p, err: err}
+	}
+}
+
+func writeCmd(dev *mft.Device, p *mft.Preset, slots []int) tea.Cmd {
+	return func() tea.Msg {
+		return writtenMsg{n: len(slots), err: dev.Push(p, slots, nil)}
+	}
+}
+
+// ---- helpers ----
+
+func (m Model) slots() int {
+	if m.preset == nil {
+		return 64
+	}
+	return m.preset.Slots()
+}
+
+func (m Model) banks() int { return m.slots() / 16 }
+
+func (m Model) rangeBounds() (int, int) {
+	if m.anchor == 0 {
+		return m.cursor, m.cursor
+	}
+	return min(m.anchor, m.cursor), max(m.anchor, m.cursor)
+}
+
+// typedRange returns From/To as typed, or ok=false if invalid.
+func (m Model) typedRange() (int, int, bool) {
+	a, errA := strconv.Atoi(m.from.Value())
+	b, errB := strconv.Atoi(m.to.Value())
+	ok := errA == nil && errB == nil && a >= 1 && b <= m.slots() && a <= b
+	return a, b, ok
+}
+
+func (m Model) value(slot int, tag byte) int {
+	v, _ := m.preset.Encoders[slot].Get(tag)
+	return v
+}
+
+func (m Model) colorMap() int {
+	if m.preset == nil {
+		return 0
+	}
+	v, _ := m.preset.Globals.Get(33)
+	return v
+}
+
+// selectionChanged syncs From/To with the grid and pre-fills untouched rows
+// with the first knob's values, so editing starts from what is there.
+func (m *Model) selectionChanged() {
+	a, b := m.rangeBounds()
+	m.from.SetValue(strconv.Itoa(a))
+	m.to.SetValue(strconv.Itoa(b))
+	m.prefill(a)
+}
+
+func (m *Model) prefill(slot int) {
+	if m.preset == nil {
+		return
+	}
+	for i, f := range mft.EncoderFields {
+		if m.rows[i].mode != keep {
+			continue
+		}
+		v := m.value(slot, f.Tag)
+		m.rows[i].val.SetValue(strconv.Itoa(v))
+		m.rows[i].choice = v
+	}
+}
+
+// rangeFromInputs moves the grid selection after From/To were typed.
+func (m *Model) rangeFromInputs() {
+	a, b, ok := m.typedRange()
+	if !ok {
+		return
+	}
+	m.anchor, m.cursor = a, b
+	m.bank = (b - 1) / 16
+	m.prefill(a)
+}
+
+func (m Model) changed() []int {
+	if m.preset == nil {
+		return nil
+	}
+	if m.base == nil {
+		all := make([]int, 0, m.slots())
+		for n := 1; n <= m.slots(); n++ {
+			all = append(all, n)
+		}
+		return all
+	}
+	return m.preset.ChangedSlots(m.base)
+}
+
+func (m Model) globalsChanged() bool {
+	return m.preset != nil && m.base != nil && !m.preset.Globals.Equal(m.base.Globals)
+}
+
+func utilityRunning() bool {
+	return exec.Command("pgrep", "-f", "Midi Fighter Utility.app").Run() == nil
+}
+
+// duplicates counts knobs whose encoder (channel, number) is used more than once.
+func duplicates(p *mft.Preset) int {
+	seen := map[[2]int]int{}
+	for _, ps := range p.Encoders {
+		ch, _ := ps.Get(16)
+		num, _ := ps.Get(17)
+		seen[[2]int{ch, num}]++
+	}
+	d := 0
+	for _, c := range seen {
+		if c > 1 {
+			d += c
+		}
+	}
+	return d
+}
+
+func expand(p string) string {
+	if strings.HasPrefix(p, "~/") {
+		h, _ := os.UserHomeDir()
+		return filepath.Join(h, p[2:])
+	}
+	return p
+}
+
+// ---- apply ----
+
+// rowValues computes the values a row would write to knobs a..b.
+func (m Model) rowValues(i, a, b int) ([]int, error) {
+	f, r := mft.EncoderFields[i], m.rows[i]
+	vals := make([]int, b-a+1)
+	if !f.Sequenceable() {
+		for k := range vals {
+			vals[k] = r.choice
+		}
+		return vals, nil
+	}
+	start, err := strconv.Atoi(r.val.Value())
+	if err != nil {
+		return nil, fmt.Errorf("%s: value must be a number", f.Name)
+	}
+	step := 0
+	if r.mode == seq {
+		if step, err = strconv.Atoi(r.step.Value()); err != nil {
+			return nil, fmt.Errorf("%s: step must be a number", f.Name)
+		}
+	}
+	for k := range vals {
+		vals[k] = start + k*step
+		if vals[k] < f.Min() || vals[k] > f.Max() {
+			return nil, fmt.Errorf("%s would reach %d on knob %d (allowed %d–%d)", f.Name, vals[k], a+k, f.Min(), f.Max())
+		}
+	}
+	return vals, nil
+}
+
+func (m *Model) apply() {
+	if m.preset == nil {
+		m.status = "Nothing to edit yet"
+		return
+	}
+	a, b, ok := m.typedRange()
+	if !ok {
+		m.status = fmt.Sprintf("From/To must be 1–%d with From ≤ To", m.slots())
+		return
+	}
+	type change struct {
+		tag  byte
+		vals []int
+	}
+	var changes []change
+	var names []string
+	for i, f := range mft.EncoderFields {
+		if m.rows[i].mode == keep {
+			continue
+		}
+		vals, err := m.rowValues(i, a, b)
+		if err != nil {
+			m.status = "Not applied: " + err.Error()
+			return
+		}
+		changes = append(changes, change{f.Tag, vals})
+		names = append(names, f.Name)
+	}
+	if len(changes) == 0 {
+		m.status = "Every row is on keep: set a mode (space) or type a value first"
+		return
+	}
+	for n := a; n <= b; n++ {
+		ps := m.preset.Encoders[n]
+		for _, c := range changes {
+			ps.Set(c.tag, c.vals[n-a])
+		}
+		m.preset.Encoders[n] = ps
+	}
+	m.status = fmt.Sprintf("Applied to knobs %d–%d: %s", a, b, strings.Join(names, ", "))
+	if d := duplicates(m.preset); d > 0 {
+		m.status += fmt.Sprintf(" · ⚠ %d knobs share an encoder channel/number", d)
+	}
+}
+
+// ---- update ----
+
+func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case readMsg:
+		m.busy = false
+		if msg.dev != nil {
+			m.dev = msg.dev
+		}
+		if msg.err != nil {
+			m.status = "Read failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.info, m.preset, m.base, m.path = msg.info, msg.preset, msg.preset.Clone(), ""
+		m.cursor, m.anchor, m.bank = min(m.cursor, m.slots()), 0, min(m.bank, m.banks()-1)
+		m.selectionChanged()
+		m.status = fmt.Sprintf("Read %d knobs from %s (firmware %s)", m.slots(), m.dev.Port, m.info.Firmware)
+	case writtenMsg:
+		m.busy = false
+		if msg.err != nil {
+			m.status = "Write failed: " + msg.err.Error()
+			return m, nil
+		}
+		m.base = m.preset.Clone()
+		m.status = fmt.Sprintf("Wrote %d knobs + globals to the device", msg.n)
+	case tea.KeyMsg:
+		return m.key(msg)
+	}
+	return m, nil
+}
+
+func (m Model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	s := k.String()
+	if s == "ctrl+c" {
+		return m, tea.Quit
+	}
+	switch m.screen {
+	case sConfirm:
+		switch s {
+		case "y", "Y":
+			m.screen = sMain
+			return m.onYes(m)
+		case "n", "N", "esc":
+			m.screen, m.status = sMain, "Cancelled"
+		}
+		return m, nil
+	case sPath:
+		switch s {
+		case "esc":
+			m.screen = sMain
+		case "enter":
+			m.screen = sMain
+			return m.finishPath()
+		default:
+			var cmd tea.Cmd
+			m.pathInput, cmd = m.pathInput.Update(k)
+			return m, cmd
+		}
+		return m, nil
+	}
+	if m.busy {
+		return m, nil
+	}
+
+	switch s {
+	case "ctrl+q":
+		return m.confirmQuit()
+	case "ctrl+r":
+		return m.startRead()
+	case "ctrl+w":
+		return m.startWrite()
+	case "ctrl+o", "ctrl+s":
+		m.pathSave = s == "ctrl+s"
+		m.screen = sPath
+		p := m.path
+		if p == "" {
+			p = "~/Dropbox/! modular/fighter_twister/"
+		}
+		m.pathInput.SetValue(p)
+		m.pathInput.CursorEnd()
+		m.pathInput.Focus()
+		return m, textinput.Blink
+	case "ctrl+g":
+		if m.screen == sGlobals {
+			m.screen = sMain
+		} else if m.preset != nil {
+			m.screen = sGlobals
+		}
+		return m, nil
+	}
+	if m.screen == sGlobals {
+		return m.globalsKey(s)
+	}
+	return m.mainKey(k)
+}
+
+func (m Model) confirmQuit() (tea.Model, tea.Cmd) {
+	if m.base == nil || len(m.changed()) == 0 && !m.globalsChanged() {
+		return m, tea.Quit
+	}
+	m.screen, m.question = sConfirm, "Quit with changes not written to the device? (y/n)"
+	m.onYes = func(m Model) (Model, tea.Cmd) { return m, tea.Quit }
+	return m, nil
+}
+
+func (m Model) startRead() (tea.Model, tea.Cmd) {
+	do := func(m Model) (Model, tea.Cmd) {
+		m.busy, m.status = true, "Reading device…"
+		return m, readCmd(m.dev)
+	}
+	if m.base != nil && (len(m.changed()) > 0 || m.globalsChanged()) {
+		m.screen, m.question, m.onYes = sConfirm, "Reading replaces your unwritten changes. Continue? (y/n)", do
+		return m, nil
+	}
+	mm, cmd := do(m)
+	return mm, cmd
+}
+
+func (m Model) startWrite() (tea.Model, tea.Cmd) {
+	if m.preset == nil {
+		return m, nil
+	}
+	if m.dev == nil {
+		m.status = "Read the device once first (ctrl+r) so the write can be checked against it"
+		return m, nil
+	}
+	devSlots := m.info.Banks * 16
+	var slots []int
+	for _, n := range m.changed() {
+		if n <= devSlots {
+			slots = append(slots, n)
+		}
+	}
+	q := fmt.Sprintf("Write %d changed knobs + globals to the device (EEPROM)?", len(slots))
+	if m.slots() > devSlots {
+		q += fmt.Sprintf(" Knobs above %d are skipped (device has %d banks).", devSlots, m.info.Banks)
+	}
+	if utilityRunning() {
+		q += " ⚠ Midi Fighter Utility is running; quit it or it may overwrite this."
+	}
+	m.screen, m.question = sConfirm, q+" (y/n)"
+	m.onYes = func(m Model) (Model, tea.Cmd) {
+		m.busy, m.status = true, fmt.Sprintf("Writing %d knobs…", len(slots))
+		return m, writeCmd(m.dev, m.preset, slots)
+	}
+	return m, nil
+}
+
+func (m Model) finishPath() (tea.Model, tea.Cmd) {
+	p := expand(strings.TrimSpace(m.pathInput.Value()))
+	if m.pathSave {
+		if m.preset == nil {
+			return m, nil
+		}
+		if !strings.HasSuffix(strings.ToLower(p), ".mfs") {
+			m.status = "File name must end in .mfs"
+			return m, nil
+		}
+		if err := m.preset.Save(p); err != nil {
+			m.status = "Save failed: " + err.Error()
+		} else {
+			m.path, m.status = p, "Saved "+p
+		}
+		return m, nil
+	}
+	pr, err := mft.Load(p)
+	if err != nil {
+		m.status = "Open failed: " + err.Error()
+		return m, nil
+	}
+	m.preset, m.path = pr, p
+	m.cursor, m.anchor, m.bank = 1, 0, 0
+	m.selectionChanged()
+	m.status = fmt.Sprintf("Opened %s (%d knobs)", filepath.Base(p), pr.Slots())
+	if m.base != nil {
+		m.status += fmt.Sprintf(" · %d knobs differ from the device", len(m.changed()))
+	}
+	return m, nil
+}
+
+func (m Model) globalsKey(s string) (tea.Model, tea.Cmd) {
+	n := len(mft.GlobalFields)
+	f := mft.GlobalFields[m.globalIdx]
+	v, _ := m.preset.Globals.Get(f.Tag)
+	delta := 0
+	switch s {
+	case "esc", "g":
+		m.screen = sMain
+	case "up", "k":
+		m.globalIdx = (m.globalIdx + n - 1) % n
+	case "down", "j":
+		m.globalIdx = (m.globalIdx + 1) % n
+	case "left", "h", "-":
+		delta = -1
+	case "right", "l", "+", "=", " ":
+		delta = 1
+	case "shift+left":
+		delta = -10
+	case "shift+right":
+		delta = 10
+	}
+	if delta != 0 {
+		nv := min(max(v+delta, f.Min()), f.Max())
+		if s == " " && nv == v { // space wraps lists and switches
+			nv = f.Min()
+		}
+		m.preset.Globals.Set(f.Tag, nv)
+	}
+	return m, nil
+}
+
+func (m Model) setFocus(f focus) Model {
+	m.from.Blur()
+	m.to.Blur()
+	m.focus = f
+	m.fresh = true
+	switch f {
+	case fFrom:
+		m.from.Focus()
+	case fTo:
+		m.to.Focus()
+	case fTable:
+		m.clampCol()
+	}
+	return m
+}
+
+// editText sends a key to a number field: the first digit after focusing
+// replaces the content.
+func (m *Model) editText(in *textinput.Model, k tea.KeyMsg) bool {
+	s := k.String()
+	digit := len(s) == 1 && (s[0] >= '0' && s[0] <= '9' || s[0] == '-')
+	if !digit && s != "backspace" && s != "delete" && s != "ctrl+u" {
+		return false
+	}
+	if m.fresh && digit {
+		in.SetValue("")
+	}
+	m.fresh = false
+	focused := in.Focused()
+	in.Focus()
+	in.CursorEnd()
+	*in, _ = in.Update(k)
+	if !focused {
+		in.Blur()
+	}
+	return true
+}
+
+func (m Model) mainKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	s := k.String()
+	switch s {
+	case "tab":
+		return m.setFocus((m.focus + 1) % numFocus), nil
+	case "shift+tab":
+		return m.setFocus((m.focus + numFocus - 1) % numFocus), nil
+	case "enter":
+		m.apply()
+		return m, nil
+	case "esc":
+		return m.setFocus(fGrid), nil
+	case "q":
+		if m.focus != fFrom && m.focus != fTo {
+			return m.confirmQuit()
+		}
+	}
+	if m.preset == nil {
+		return m, nil
+	}
+	switch m.focus {
+	case fGrid:
+		m.gridKey(s)
+	case fFrom, fTo:
+		in := &m.from
+		if m.focus == fTo {
+			in = &m.to
+		}
+		if m.editText(in, k) {
+			m.rangeFromInputs()
+		}
+	case fTable:
+		m.tableKey(k)
+	case fApply:
+		if s == " " {
+			m.apply()
+		}
+	}
+	return m, nil
+}
+
+func (m *Model) maxCol(i int) int {
+	if !mft.EncoderFields[i].Sequenceable() || m.rows[i].mode != seq {
+		return cValue
+	}
+	return cStep
+}
+
+// minCol: list and on/off rows have only the value cell.
+func (m *Model) minCol(i int) int {
+	if !mft.EncoderFields[i].Sequenceable() {
+		return cValue
+	}
+	return cMode
+}
+
+func (m *Model) clampCol() { m.col = min(max(m.col, m.minCol(m.row)), m.maxCol(m.row)) }
+
+// nudge adds d to a number field's text value.
+func nudge(in *textinput.Model, d, lo, hi int) {
+	v, err := strconv.Atoi(in.Value())
+	if err != nil {
+		v = lo
+	}
+	in.SetValue(strconv.Itoa(min(max(v+d, lo), hi)))
+}
+
+func (m *Model) tableKey(k tea.KeyMsg) {
+	s := k.String()
+	f := mft.EncoderFields[m.row]
+	r := &m.rows[m.row]
+	switch s {
+	case "up", "k":
+		m.row = max(m.row-1, 0)
+		m.fresh = true
+		m.clampCol()
+		return
+	case "down", "j":
+		m.row = min(m.row+1, len(m.rows)-1)
+		m.fresh = true
+		m.clampCol()
+		return
+	case "left", "h", "right", "l":
+		if !f.Sequenceable() { // list rows: arrows pick the value
+			n := f.Max() + 1
+			if s == "left" || s == "h" {
+				r.choice = (r.choice + n - 1) % n
+			} else {
+				r.choice = (r.choice + 1) % n
+			}
+			if r.mode == keep {
+				r.mode = same
+			}
+			return
+		}
+		if s == "left" || s == "h" {
+			m.col = max(m.col-1, cMode)
+		} else {
+			m.col = min(m.col+1, m.maxCol(m.row))
+		}
+		m.fresh = true
+		return
+	case "x":
+		r.mode = keep
+		a, _ := m.rangeBounds()
+		m.prefill(a)
+		m.clampCol()
+		return
+	case "c":
+		for i := range m.rows {
+			m.rows[i].mode = keep
+		}
+		a, _ := m.rangeBounds()
+		m.prefill(a)
+		m.clampCol()
+		return
+	}
+	switch m.col {
+	case cMode:
+		if s == " " {
+			switch {
+			case r.mode == keep:
+				r.mode = same
+			case r.mode == same && f.Sequenceable():
+				r.mode = seq
+			default:
+				r.mode = keep
+				a, _ := m.rangeBounds()
+				m.prefill(a)
+			}
+		}
+	case cValue:
+		if f.Sequenceable() {
+			if s == "+" || s == "=" || s == "-" {
+				d := map[bool]int{true: -1, false: 1}[s == "-"]
+				nudge(&r.val, d, f.Min(), f.Max())
+				if r.mode == keep {
+					r.mode = same
+				}
+				return
+			}
+			if m.editText(&r.val, k) && r.mode == keep {
+				r.mode = same
+			}
+			return
+		}
+		n := f.Max() + 1
+		switch s {
+		case " ", "+", "=":
+			r.choice = (r.choice + 1) % n
+		case "-":
+			r.choice = (r.choice + n - 1) % n
+		default:
+			return
+		}
+		if r.mode == keep {
+			r.mode = same
+		}
+	case cStep:
+		if s == "+" || s == "=" {
+			nudge(&r.step, 1, -127, 127)
+			return
+		}
+		m.editText(&r.step, k)
+	}
+}
+
+// gridKey moves in knob order like a text cursor: left/right wrap across
+// rows and banks, up/down move 4 knobs; with shift the range extends.
+func (m *Model) gridKey(s string) {
+	idx := (m.cursor - 1) % 16
+	extend := strings.HasPrefix(s, "shift+")
+	delta := map[string]int{"up": -4, "k": -4, "down": 4, "j": 4, "left": -1, "h": -1, "right": 1, "l": 1}[strings.TrimPrefix(s, "shift+")]
+	if delta != 0 {
+		next := m.cursor + delta
+		if next < 1 || next > m.slots() {
+			return
+		}
+		if extend && m.anchor == 0 {
+			m.anchor = m.cursor
+		} else if !extend {
+			m.anchor = 0
+		}
+		m.cursor = next
+		m.bank = (next - 1) / 16
+		m.selectionChanged()
+		return
+	}
+	switch {
+	case s == "[" || s == "pgup":
+		m.bank = max(m.bank-1, 0)
+	case s == "]" || s == "pgdown":
+		m.bank = min(m.bank+1, m.banks()-1)
+	case len(s) == 1 && s[0] >= '1' && s[0] <= '8' && int(s[0]-'1') < m.banks():
+		m.bank = int(s[0] - '1')
+	case s == "a": // select the whole bank
+		m.anchor, m.cursor = m.bank*16+1, m.bank*16+16
+		m.selectionChanged()
+		return
+	default:
+		return
+	}
+	m.cursor, m.anchor = m.bank*16+idx+1, 0
+	m.selectionChanged()
+}
+
+// ---- view ----
+
+var (
+	sTitle   = lipgloss.NewStyle().Bold(true)
+	sDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	sCell    = lipgloss.NewStyle().Width(16).Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8"))
+	sSel     = sCell.Background(lipgloss.Color("24"))
+	cursorBC = lipgloss.Color("14")
+	sFocused = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
+	sEdit    = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	sWarn    = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+	sErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
+	sBox     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+)
+
+var typeShort = []string{"note", "cc", "rel", "bvel", "mouse", "scrl", "pc"}
+
+func hex(c [3]uint8) lipgloss.Color {
+	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", c[0], c[1], c[2]))
+}
+
+func swatch(c [3]uint8, w int) string {
+	return lipgloss.NewStyle().Foreground(hex(c)).Render(strings.Repeat("█", w))
+}
+
+func (m Model) cell(slot int) string {
+	ps := m.preset.Encoders[slot]
+	get := func(t byte) int { v, _ := ps.Get(t); return v }
+	t := "?"
+	if et := get(18); et < len(typeShort) {
+		t = typeShort[et]
+	}
+	mark := " "
+	if m.base != nil {
+		if b, ok := m.base.Encoders[slot]; !ok || !ps.Equal(b) {
+			mark = sWarn.Render("*")
+		}
+	}
+	cm := m.colorMap()
+	strip := swatch(mft.PaletteRGB(cm, get(20)), 5) + " " + swatch(mft.PaletteRGB(cm, get(19)), 5) + " " + swatch(mft.DetentRGB(get(21)), 2)
+	return fmt.Sprintf("#%d%s\n%d:%s%d\nb%d:%d\n%s", slot, mark, get(16), t, get(17), get(13), get(14), strip)
+}
+
+func (m Model) grid() string {
+	a, b := m.rangeBounds()
+	var rows []string
+	for r := 0; r < 4; r++ {
+		var cells []string
+		for c := 0; c < 4; c++ {
+			slot := m.bank*16 + r*4 + c + 1
+			st := sCell
+			if slot >= a && slot <= b {
+				st = sSel
+			}
+			if slot == m.cursor {
+				st = st.BorderForeground(cursorBC)
+			}
+			cells = append(cells, st.Render(m.cell(slot)))
+		}
+		rows = append(rows, lipgloss.JoinHorizontal(lipgloss.Top, cells...))
+	}
+	legend := sDim.Render("#knob · encoder ch:type+number · b button ch:number\nstrip: off colour · on colour · detent colour")
+	return lipgloss.JoinVertical(lipgloss.Left, append(rows, legend)...)
+}
+
+func (m Model) bankBar() string {
+	var parts []string
+	for b := 0; b < m.banks(); b++ {
+		if b == m.bank {
+			parts = append(parts, sFocused.Render(fmt.Sprintf("[%d]", b+1)))
+		} else {
+			parts = append(parts, fmt.Sprintf(" %d ", b+1))
+		}
+	}
+	return "Bank " + strings.Join(parts, "")
+}
+
+// now summarises a setting over the selected range.
+func (m Model) now(f mft.Field) string {
+	a, b := m.rangeBounds()
+	lo, hi := 1<<30, -1
+	for n := a; n <= b; n++ {
+		v := m.value(n, f.Tag)
+		lo, hi = min(lo, v), max(hi, v)
+	}
+	if lo == hi {
+		return f.Format(lo)
+	}
+	if f.Kind == mft.Enum || f.Kind == mft.Bool {
+		return "mixed"
+	}
+	return fmt.Sprintf("%d…%d", lo, hi)
+}
+
+func pad(s string, w int) string {
+	if n := lipgloss.Width(s); n < w {
+		return s + strings.Repeat(" ", w-n)
+	}
+	return s
+}
+
+func (m Model) cellText(i, col int, text string) string {
+	if m.focus == fTable && m.row == i && m.col == col {
+		return sFocused.Render("‹" + text + "›")
+	}
+	return " " + text + " "
+}
+
+func (m Model) colorOf(tag byte, v int) [3]uint8 {
+	if tag == 21 {
+		return mft.DetentRGB(v)
+	}
+	return mft.PaletteRGB(m.colorMap(), v)
+}
+
+func isColor(tag byte) bool { return tag == 19 || tag == 20 || tag == 21 }
+
+func (m Model) table() string {
+	a, b := m.rangeBounds()
+	var lines []string
+	head := "  " + pad("Setting", 23) + pad("Now", 20) + pad("Mode", 12) + pad("Value", 22) + pad("Step", 7) + "Result"
+	lines = append(lines, sDim.Render(head))
+	for i, f := range mft.EncoderFields {
+		r := m.rows[i]
+		marker := "  "
+		if m.focus == fTable && m.row == i {
+			marker = sFocused.Render("▸ ")
+		}
+		name := f.Name
+		if r.mode != keep {
+			name = sEdit.Render(name)
+		}
+		nowS := m.now(f)
+		if isColor(f.Tag) {
+			nowS = swatch(m.colorOf(f.Tag, m.value(a, f.Tag)), 2) + " " + nowS
+		}
+		modeS := m.cellText(i, cMode, modeNames[r.mode])
+		var valS, stepS, result string
+		switch {
+		case r.mode == keep:
+			valS = sDim.Render(m.cellText(i, cValue, "—"))
+		case f.Sequenceable():
+			label := "Value"
+			if r.mode == seq {
+				label = "Start"
+			}
+			valS = m.cellText(i, cValue, sDim.Render(label)+" "+pad(r.val.Value(), 3))
+			if r.mode == seq {
+				stepS = m.cellText(i, cStep, pad(r.step.Value(), 3))
+			}
+			if vals, err := m.rowValues(i, a, b); err != nil {
+				result = sErr.Render("✗ out of range")
+			} else {
+				result = fmt.Sprintf("→ %d", vals[0])
+				if vals[0] != vals[len(vals)-1] {
+					result = fmt.Sprintf("→ %d…%d", vals[0], vals[len(vals)-1])
+				}
+				if isColor(f.Tag) {
+					result = swatch(m.colorOf(f.Tag, vals[0]), 2) + " " + result
+				}
+			}
+		default:
+			valS = m.cellText(i, cValue, f.Format(r.choice))
+		}
+		lines = append(lines, marker+pad(name, 23)+pad(nowS, 20)+pad(modeS, 12)+pad(valS, 22)+pad(stepS, 7)+result)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) rangeLine() string {
+	lbl := func(f focus, t string) string {
+		if m.focus == f {
+			return sFocused.Render("▸ " + t)
+		}
+		return "  " + t
+	}
+	a, b := m.rangeBounds()
+	n := b - a + 1
+	knobs := "knobs"
+	if n == 1 {
+		knobs = "knob"
+	}
+	apply := "  [ Apply ]"
+	if m.focus == fApply {
+		apply = sFocused.Render("▸ [ Apply ]")
+	}
+	return fmt.Sprintf("%s %s %s %s  %s   %s %s", lbl(fFrom, "From knob"), pad(m.from.Value(), 4), lbl(fTo, "To knob"), pad(m.to.Value(), 4),
+		sDim.Render(fmt.Sprintf("(%d %s)", n, knobs)), apply, sDim.Render("enter applies all rows not on keep"))
+}
+
+func (m Model) globalsView() string {
+	var lines []string
+	lines = append(lines, sTitle.Render("Global settings")+sDim.Render("   ↑↓ select · ←→ or -/+ change · shift+←→ ±10 · esc back"))
+	for i, f := range mft.GlobalFields {
+		v, _ := m.preset.Globals.Get(f.Tag)
+		mark := " "
+		if m.base != nil {
+			if bv, _ := m.base.Globals.Get(f.Tag); bv != v {
+				mark = "*"
+			}
+		}
+		line := fmt.Sprintf("%-28s %s%s", f.Name, f.Format(v), mark)
+		if i == m.globalIdx {
+			line = sFocused.Render("▸ " + line)
+		} else {
+			line = "  " + line
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) header() string {
+	src := "no source"
+	switch {
+	case m.path != "":
+		src = filepath.Base(m.path)
+	case m.base != nil:
+		src = "device"
+	}
+	h := sTitle.Render("mft-tui") + "  " + src
+	if m.info.Firmware != "" {
+		h += sDim.Render(fmt.Sprintf("  · fw %s · %d banks", m.info.Firmware, m.info.Banks))
+	}
+	if m.base != nil {
+		n := len(m.changed())
+		g := ""
+		if m.globalsChanged() {
+			g = " + globals"
+		}
+		if n > 0 || g != "" {
+			h += sWarn.Render(fmt.Sprintf("  · %d knobs%s not written", n, g))
+		}
+	}
+	return h
+}
+
+const help = "tab/⇧tab: grid → from → to → table → apply · grid: arrows move in knob order across banks · ⇧arrows extend range · [ ] 1–8 bank · a whole bank\n" +
+	"table: ↑↓ row · list rows: ←→/space pick value · number rows: ←→ mode/value/step, space cycles mode, digits or -/+ · x row→keep · c all→keep · enter apply\n" +
+	"^r read device · ^w write device · ^o open · ^s save .mfs · ^g globals · q/^q quit"
+
+func (m Model) View() string {
+	var body string
+	switch {
+	case m.preset == nil:
+		body = "\n  (no preset)\n"
+	case m.screen == sGlobals:
+		body = sBox.Render(m.globalsView())
+	default:
+		left := lipgloss.JoinVertical(lipgloss.Left, m.bankBar(), m.grid())
+		right := sBox.Render(lipgloss.JoinVertical(lipgloss.Left, m.rangeLine(), "", m.table()))
+		body = lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
+	}
+	out := m.header() + "\n" + body + "\n"
+	switch m.screen {
+	case sConfirm:
+		out += sWarn.Render(m.question) + "\n"
+	case sPath:
+		verb := "Open"
+		if m.pathSave {
+			verb = "Save as"
+		}
+		out += verb + ": " + m.pathInput.View() + sDim.Render("  (enter / esc)") + "\n"
+	default:
+		out += m.status + "\n"
+	}
+	return out + sDim.Render(help)
+}
