@@ -74,6 +74,9 @@ type Model struct {
 	rows                 []row
 	row, col             int
 	fresh                bool // next digit replaces the focused field's content
+	pickMode             bool // selection is a picked set instead of From–To
+	picks                []int
+	knobs                textinput.Model // pick mode: typed knob list
 
 	screen    screen
 	globalIdx int
@@ -94,7 +97,9 @@ func numInput() textinput.Model {
 }
 
 func New(preset *mft.Preset, path string) Model {
-	m := Model{preset: preset, path: path, cursor: 1, from: numInput(), to: numInput()}
+	m := Model{preset: preset, path: path, cursor: 1, from: numInput(), to: numInput(), knobs: textinput.New()}
+	m.knobs.Prompt = ""
+	m.knobs.Width = 40
 	for range mft.EncoderFields {
 		r := row{val: numInput(), step: numInput()}
 		r.step.SetValue("1")
@@ -194,6 +199,10 @@ func (m Model) colorMap() int {
 // selectionChanged syncs From/To with the grid and pre-fills untouched rows
 // with the first knob's values, so editing starts from what is there.
 func (m *Model) selectionChanged() {
+	if m.pickMode {
+		m.prefill(m.firstSelected())
+		return
+	}
 	a, b := m.rangeBounds()
 	m.from.SetValue(strconv.Itoa(a))
 	m.to.SetValue(strconv.Itoa(b))
@@ -266,10 +275,10 @@ func duplicates(p *mft.Preset) int {
 
 // ---- apply ----
 
-// rowValues computes the values a row would write to knobs a..b.
-func (m Model) rowValues(i, a, b int) ([]int, error) {
+// rowValues computes the values a row would write to the given knobs.
+func (m Model) rowValues(i int, knobs []int) ([]int, error) {
 	f, r := mft.EncoderFields[i], m.rows[i]
-	vals := make([]int, b-a+1)
+	vals := make([]int, len(knobs))
 	if !f.Sequenceable() {
 		for k := range vals {
 			vals[k] = r.choice
@@ -289,7 +298,7 @@ func (m Model) rowValues(i, a, b int) ([]int, error) {
 	for k := range vals {
 		vals[k] = start + k*step
 		if vals[k] < f.Min() || vals[k] > f.Max() {
-			return nil, fmt.Errorf("%s would reach %d on knob %d (allowed %d–%d)", f.Name, vals[k], a+k, f.Min(), f.Max())
+			return nil, fmt.Errorf("%s would reach %d on knob %d (allowed %d–%d)", f.Name, vals[k], knobs[k], f.Min(), f.Max())
 		}
 	}
 	return vals, nil
@@ -300,9 +309,13 @@ func (m *Model) apply() {
 		m.status = "Nothing to edit yet"
 		return
 	}
-	a, b, ok := m.typedRange()
-	if !ok {
+	if _, _, ok := m.typedRange(); !ok && !m.pickMode {
 		m.status = fmt.Sprintf("From/To must be 1–%d with From ≤ To", m.slots())
+		return
+	}
+	knobs := m.selected()
+	if len(knobs) == 0 {
+		m.status = "No knobs picked: s adds the knob under the cursor, or type a list"
 		return
 	}
 	type change struct {
@@ -315,7 +328,7 @@ func (m *Model) apply() {
 		if m.rows[i].mode == keep {
 			continue
 		}
-		vals, err := m.rowValues(i, a, b)
+		vals, err := m.rowValues(i, knobs)
 		if err != nil {
 			m.status = "Not applied: " + err.Error()
 			return
@@ -327,14 +340,14 @@ func (m *Model) apply() {
 		m.status = "Every row is on keep: set a mode (space) or type a value first"
 		return
 	}
-	for n := a; n <= b; n++ {
+	for k, n := range knobs {
 		ps := m.preset.Encoders[n]
 		for _, c := range changes {
-			ps.Set(c.tag, c.vals[n-a])
+			ps.Set(c.tag, c.vals[k])
 		}
 		m.preset.Encoders[n] = ps
 	}
-	m.status = fmt.Sprintf("Applied to knobs %d–%d: %s", a, b, strings.Join(names, ", "))
+	m.status = fmt.Sprintf("Applied to knobs %s: %s", formatKnobs(knobs), strings.Join(names, ", "))
 	if d := duplicates(m.preset); d > 0 {
 		m.status += fmt.Sprintf(" · ⚠ %d knobs share an encoder channel/number", d)
 	}
@@ -556,6 +569,13 @@ func (m Model) globalsKey(s string) (tea.Model, tea.Cmd) {
 func (m Model) setFocus(f focus) Model {
 	m.from.Blur()
 	m.to.Blur()
+	if m.pickMode && f == fTo { // single Knobs field: skip To
+		if m.focus == fFrom {
+			f = fTable
+		} else {
+			f = fFrom
+		}
+	}
 	m.focus = f
 	m.fresh = true
 	switch f {
@@ -602,6 +622,11 @@ func (m Model) mainKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.apply()
 		return m, nil
 	case "esc":
+		if m.pickMode && m.focus == fGrid {
+			m.exitPick()
+			m.status = "Pick mode off"
+			return m, nil
+		}
 		return m.setFocus(fGrid), nil
 	case "q":
 		if m.focus != fFrom && m.focus != fTo {
@@ -615,6 +640,10 @@ func (m Model) mainKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case fGrid:
 		m.gridKey(s)
 	case fFrom, fTo:
+		if m.pickMode {
+			m.listEdit(s)
+			return m, nil
+		}
 		in := &m.from
 		if m.focus == fTo {
 			in = &m.to
@@ -695,16 +724,14 @@ func (m *Model) tableKey(k tea.KeyMsg) {
 		return
 	case "x":
 		r.mode = keep
-		a, _ := m.rangeBounds()
-		m.prefill(a)
+		m.prefill(m.firstSelected())
 		m.clampCol()
 		return
 	case "c":
 		for i := range m.rows {
 			m.rows[i].mode = keep
 		}
-		a, _ := m.rangeBounds()
-		m.prefill(a)
+		m.prefill(m.firstSelected())
 		m.clampCol()
 		return
 	}
@@ -718,8 +745,7 @@ func (m *Model) tableKey(k tea.KeyMsg) {
 				r.mode = seq
 			default:
 				r.mode = keep
-				a, _ := m.rangeBounds()
-				m.prefill(a)
+				m.prefill(m.firstSelected())
 			}
 		}
 	case cValue:
@@ -769,6 +795,14 @@ func (m *Model) gridKey(s string) {
 		if next < 1 || next > m.slots() {
 			return
 		}
+		if m.pickMode && !extend { // pick mode: arrows only move the cursor
+			m.cursor, m.bank = next, (next-1)/16
+			return
+		}
+		if m.pickMode && extend { // shift+arrow leaves pick mode, starts a range here
+			m.exitPick()
+			m.status = "Pick mode off"
+		}
 		if extend && m.anchor == 0 {
 			m.anchor = m.cursor
 		} else if !extend {
@@ -786,11 +820,26 @@ func (m *Model) gridKey(s string) {
 		m.bank = min(m.bank+1, m.banks()-1)
 	case len(s) == 1 && s[0] >= '1' && s[0] <= '8' && int(s[0]-'1') < m.banks():
 		m.bank = int(s[0] - '1')
-	case s == "a": // select the whole bank
+	case s == "s": // pick mode: toggle the knob under the cursor
+		m.togglePick(m.cursor)
+		return
+	case s == "a": // whole bank: range, or toggle it in pick mode
+		if m.pickMode {
+			var bank []int
+			for n := m.bank*16 + 1; n <= m.bank*16+16; n++ {
+				bank = append(bank, n)
+			}
+			m.togglePick(bank...)
+			return
+		}
 		m.anchor, m.cursor = m.bank*16+1, m.bank*16+16
 		m.selectionChanged()
 		return
 	default:
+		return
+	}
+	if m.pickMode {
+		m.cursor = m.bank*16 + idx + 1
 		return
 	}
 	m.cursor, m.anchor = m.bank*16+idx+1, 0
@@ -842,14 +891,13 @@ func (m Model) cell(slot int) string {
 }
 
 func (m Model) grid() string {
-	a, b := m.rangeBounds()
 	var rows []string
 	for r := 0; r < 4; r++ {
 		var cells []string
 		for c := 0; c < 4; c++ {
 			slot := m.bank*16 + r*4 + c + 1
 			st := sCell
-			if slot >= a && slot <= b {
+			if m.isSelected(slot) {
 				st = sSel
 			}
 			if slot == m.cursor {
@@ -865,11 +913,19 @@ func (m Model) grid() string {
 
 func (m Model) bankBar() string {
 	var parts []string
+	has := map[int]bool{} // banks holding selected knobs
+	for _, n := range m.selected() {
+		has[(n-1)/16] = true
+	}
 	for b := 0; b < m.banks(); b++ {
+		mark := " "
+		if has[b] {
+			mark = "•"
+		}
 		if b == m.bank {
-			parts = append(parts, sKey.Bold(true).Render(fmt.Sprintf("[%d]", b+1)))
+			parts = append(parts, sKey.Bold(true).Render(fmt.Sprintf("[%d]", b+1))+sKey.Render(mark))
 		} else {
-			parts = append(parts, sKey.Render(fmt.Sprintf(" %d ", b+1)))
+			parts = append(parts, sKey.Render(fmt.Sprintf(" %d%s", b+1, mark)))
 		}
 	}
 	return "Bank " + strings.Join(parts, "")
@@ -877,9 +933,12 @@ func (m Model) bankBar() string {
 
 // now summarises a setting over the selected range.
 func (m Model) now(f mft.Field) string {
-	a, b := m.rangeBounds()
+	sel := m.selected()
+	if len(sel) == 0 {
+		return "—"
+	}
 	lo, hi := 1<<30, -1
-	for n := a; n <= b; n++ {
+	for _, n := range sel {
 		v := m.value(n, f.Tag)
 		lo, hi = min(lo, v), max(hi, v)
 	}
@@ -916,7 +975,8 @@ func (m Model) colorOf(tag byte, v int) [3]uint8 {
 func isColor(tag byte) bool { return tag == 19 || tag == 20 || tag == 21 }
 
 func (m Model) table() string {
-	a, b := m.rangeBounds()
+	sel := m.selected()
+	first := m.firstSelected()
 	var lines []string
 	head := "  " + pad("Setting", 22) + pad("Now", 20) + pad("Mode", 11) + pad("Value", 12) + pad("Step", 7) + "Result"
 	lines = append(lines, sDim.Render(head))
@@ -932,7 +992,7 @@ func (m Model) table() string {
 		}
 		nowS := m.now(f)
 		if isColor(f.Tag) {
-			nowS = swatch(m.colorOf(f.Tag, m.value(a, f.Tag)), 2) + " " + nowS
+			nowS = swatch(m.colorOf(f.Tag, m.value(first, f.Tag)), 2) + " " + nowS
 		}
 		modeS := m.cellText(i, cMode, modeNames[r.mode])
 		var valS, stepS, result string
@@ -948,7 +1008,9 @@ func (m Model) table() string {
 			if r.mode == seq {
 				stepS = m.cellText(i, cStep, pad(r.step.Value(), 3))
 			}
-			if vals, err := m.rowValues(i, a, b); err != nil {
+			if len(sel) == 0 {
+				result = ""
+			} else if vals, err := m.rowValues(i, sel); err != nil {
 				result = sErr.Render("✗ out of range")
 			} else {
 				result = fmt.Sprintf("→ %d", vals[0])
@@ -974,11 +1036,17 @@ func (m Model) rangeLine() string {
 		}
 		return "  " + sKey.Render(t)
 	}
-	a, b := m.rangeBounds()
-	n := b - a + 1
+	n := len(m.selected())
 	knobs := "knobs"
 	if n == 1 {
 		knobs = "knob"
+	}
+	if m.pickMode {
+		list := m.knobs.Value()
+		if list == "" {
+			list = sDim.Render("(none: s adds, or type 1 3 5-8)")
+		}
+		return fmt.Sprintf("%s %s  %s", lbl(fFrom, "Knobs:"), list, sDim.Render(fmt.Sprintf("(%d %s · esc or ⇧arrow ends picking)", n, knobs)))
 	}
 	return fmt.Sprintf("%s %s %s %s  %s", lbl(fFrom, "From knob"), pad(m.from.Value(), 4), lbl(fTo, "To knob"), pad(m.to.Value(), 4),
 		sDim.Render(fmt.Sprintf("(%d %s)", n, knobs)))
@@ -1041,7 +1109,7 @@ func (m Model) header() string {
 
 // help lines: pairs of key, description.
 var helpLines = [][][2]string{
-	{{"tab/⇧tab", "grid → from → to → table → apply"}, {"arrows", "move in knob order across banks"}, {"⇧arrows", "extend range"}, {"[ ] 1–8", "bank"}, {"a", "whole bank"}},
+	{{"tab/⇧tab", "grid → from → to → table → apply"}, {"arrows", "move in knob order across banks"}, {"⇧arrows", "extend range"}, {"[ ] 1–8", "bank"}, {"a", "whole bank"}, {"s", "pick/unpick knob"}},
 	{{"↑↓", "row"}, {"←→/space", "list rows: pick value · number rows: mode/value/step"}, {"space", "cycles mode"}, {"digits -/+", "value"}, {"x", "row→keep"}, {"c", "all→keep"}, {"enter", "apply"}},
 	{{"^r", "read device"}, {"^w", "write device"}, {"^o", "open"}, {"^s", "save .mfs"}, {"^g", "globals"}, {"q/^q", "quit"}},
 }
