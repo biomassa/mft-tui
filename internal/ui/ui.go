@@ -33,7 +33,7 @@ type screen int
 const (
 	sMain screen = iota
 	sGlobals
-	sPath    // open/save path prompt
+	sPicker  // open/save file browser
 	sConfirm // y/n question
 )
 
@@ -77,8 +77,8 @@ type Model struct {
 
 	screen    screen
 	globalIdx int
-	pathInput textinput.Model
-	pathSave  bool
+	pick      picker
+	height    int
 	question  string
 	onYes     func(Model) (Model, tea.Cmd)
 	status    string
@@ -100,8 +100,6 @@ func New(preset *mft.Preset, path string) Model {
 		r.step.SetValue("1")
 		m.rows = append(m.rows, r)
 	}
-	m.pathInput = textinput.New()
-	m.pathInput.Width = 70
 	m.selectionChanged()
 	if preset == nil {
 		m.status = "No preset loaded: ctrl+r reads the device, ctrl+o opens a file"
@@ -266,14 +264,6 @@ func duplicates(p *mft.Preset) int {
 	return d
 }
 
-func expand(p string) string {
-	if strings.HasPrefix(p, "~/") {
-		h, _ := os.UserHomeDir()
-		return filepath.Join(h, p[2:])
-	}
-	return p
-}
-
 // ---- apply ----
 
 // rowValues computes the values a row would write to knobs a..b.
@@ -354,6 +344,8 @@ func (m *Model) apply() {
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
 	case readMsg:
 		m.busy = false
 		if msg.dev != nil {
@@ -396,19 +388,16 @@ func (m Model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.screen, m.status = sMain, "Cancelled"
 		}
 		return m, nil
-	case sPath:
-		switch s {
-		case "esc":
-			m.screen = sMain
-		case "enter":
-			m.screen = sMain
-			return m.finishPath()
-		default:
-			var cmd tea.Cmd
-			m.pathInput, cmd = m.pathInput.Update(k)
-			return m, cmd
+	case sPicker:
+		res := m.pick.key(k)
+		if res == nil {
+			return m, nil
 		}
-		return m, nil
+		m.screen = sMain
+		if res.cancel {
+			return m, nil
+		}
+		return m.finishPick(res.path)
 	}
 	if m.busy {
 		return m, nil
@@ -422,15 +411,16 @@ func (m Model) key(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "ctrl+w":
 		return m.startWrite()
 	case "ctrl+o", "ctrl+s":
-		m.pathSave = s == "ctrl+s"
-		m.screen = sPath
-		p := m.path
-		if p == "" {
-			p = "~/Dropbox/! modular/fighter_twister/"
+		save := s == "ctrl+s"
+		if save && m.preset == nil {
+			return m, nil
 		}
-		m.pathInput.SetValue(p)
-		m.pathInput.CursorEnd()
-		m.pathInput.Focus()
+		dir, name := "", ""
+		if m.path != "" {
+			dir, name = filepath.Dir(m.path), filepath.Base(m.path)
+		}
+		m.pick = newPicker(save, dir, name)
+		m.screen = sPicker
 		return m, textinput.Blink
 	case "ctrl+g":
 		if m.screen == sGlobals {
@@ -498,22 +488,23 @@ func (m Model) startWrite() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) finishPath() (tea.Model, tea.Cmd) {
-	p := expand(strings.TrimSpace(m.pathInput.Value()))
-	if m.pathSave {
-		if m.preset == nil {
+func (m Model) finishPick(p string) (tea.Model, tea.Cmd) {
+	if m.pick.save {
+		save := func(m Model) (Model, tea.Cmd) {
+			if err := m.preset.Save(p); err != nil {
+				m.status = "Save failed: " + err.Error()
+			} else {
+				m.path, m.status = p, "Saved "+p
+				addRecent(p)
+			}
 			return m, nil
 		}
-		if !strings.HasSuffix(strings.ToLower(p), ".mfs") {
-			m.status = "File name must end in .mfs"
+		if _, err := os.Stat(p); err == nil {
+			m.screen, m.question, m.onYes = sConfirm, fmt.Sprintf("Overwrite %s? (y/n)", filepath.Base(p)), save
 			return m, nil
 		}
-		if err := m.preset.Save(p); err != nil {
-			m.status = "Save failed: " + err.Error()
-		} else {
-			m.path, m.status = p, "Saved "+p
-		}
-		return m, nil
+		mm, cmd := save(m)
+		return mm, cmd
 	}
 	pr, err := mft.Load(p)
 	if err != nil {
@@ -521,6 +512,7 @@ func (m Model) finishPath() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.preset, m.path = pr, p
+	addRecent(p)
 	m.cursor, m.anchor, m.bank = 1, 0, 0
 	m.selectionChanged()
 	m.status = fmt.Sprintf("Opened %s (%d knobs)", filepath.Base(p), pr.Slots())
@@ -810,7 +802,7 @@ func (m *Model) gridKey(s string) {
 var (
 	sTitle   = lipgloss.NewStyle().Bold(true)
 	sDim     = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-	sCell    = lipgloss.NewStyle().Width(16).Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8"))
+	sCell    = lipgloss.NewStyle().Width(13).Padding(0, 1).Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("8"))
 	sSel     = sCell.Background(lipgloss.Color("24"))
 	cursorBC = lipgloss.Color("14")
 	sFocused = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
@@ -818,6 +810,7 @@ var (
 	sWarn    = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
 	sErr     = lipgloss.NewStyle().Foreground(lipgloss.Color("9"))
 	sBox     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
+	sKey     = lipgloss.NewStyle().Foreground(lipgloss.Color("#fab387")) // peach: keys and actionable labels
 )
 
 var typeShort = []string{"note", "cc", "rel", "bvel", "mouse", "scrl", "pc"}
@@ -844,7 +837,7 @@ func (m Model) cell(slot int) string {
 		}
 	}
 	cm := m.colorMap()
-	strip := swatch(mft.PaletteRGB(cm, get(20)), 5) + " " + swatch(mft.PaletteRGB(cm, get(19)), 5) + " " + swatch(mft.DetentRGB(get(21)), 2)
+	strip := swatch(mft.PaletteRGB(cm, get(20)), 5) + " " + swatch(mft.PaletteRGB(cm, get(19)), 3) + " " + swatch(mft.DetentRGB(get(21)), 1)
 	return fmt.Sprintf("#%d%s\n%d:%s%d\nb%d:%d\n%s", slot, mark, get(16), t, get(17), get(13), get(14), strip)
 }
 
@@ -874,9 +867,9 @@ func (m Model) bankBar() string {
 	var parts []string
 	for b := 0; b < m.banks(); b++ {
 		if b == m.bank {
-			parts = append(parts, sFocused.Render(fmt.Sprintf("[%d]", b+1)))
+			parts = append(parts, sKey.Bold(true).Render(fmt.Sprintf("[%d]", b+1)))
 		} else {
-			parts = append(parts, fmt.Sprintf(" %d ", b+1))
+			parts = append(parts, sKey.Render(fmt.Sprintf(" %d ", b+1)))
 		}
 	}
 	return "Bank " + strings.Join(parts, "")
@@ -925,7 +918,7 @@ func isColor(tag byte) bool { return tag == 19 || tag == 20 || tag == 21 }
 func (m Model) table() string {
 	a, b := m.rangeBounds()
 	var lines []string
-	head := "  " + pad("Setting", 23) + pad("Now", 20) + pad("Mode", 12) + pad("Value", 22) + pad("Step", 7) + "Result"
+	head := "  " + pad("Setting", 22) + pad("Now", 20) + pad("Mode", 11) + pad("Value", 12) + pad("Step", 7) + "Result"
 	lines = append(lines, sDim.Render(head))
 	for i, f := range mft.EncoderFields {
 		r := m.rows[i]
@@ -969,7 +962,7 @@ func (m Model) table() string {
 		default:
 			valS = m.cellText(i, cValue, f.Format(r.choice))
 		}
-		lines = append(lines, marker+pad(name, 23)+pad(nowS, 20)+pad(modeS, 12)+pad(valS, 22)+pad(stepS, 7)+result)
+		lines = append(lines, marker+pad(name, 22)+pad(nowS, 20)+pad(modeS, 11)+pad(valS, 12)+pad(stepS, 7)+result)
 	}
 	return strings.Join(lines, "\n")
 }
@@ -979,7 +972,7 @@ func (m Model) rangeLine() string {
 		if m.focus == f {
 			return sFocused.Render("▸ " + t)
 		}
-		return "  " + t
+		return "  " + sKey.Render(t)
 	}
 	a, b := m.rangeBounds()
 	n := b - a + 1
@@ -987,12 +980,16 @@ func (m Model) rangeLine() string {
 	if n == 1 {
 		knobs = "knob"
 	}
-	apply := "  [ Apply ]"
+	return fmt.Sprintf("%s %s %s %s  %s", lbl(fFrom, "From knob"), pad(m.from.Value(), 4), lbl(fTo, "To knob"), pad(m.to.Value(), 4),
+		sDim.Render(fmt.Sprintf("(%d %s)", n, knobs)))
+}
+
+func (m Model) applyLine() string {
+	apply := "  " + sKey.Render("[ Apply ]")
 	if m.focus == fApply {
 		apply = sFocused.Render("▸ [ Apply ]")
 	}
-	return fmt.Sprintf("%s %s %s %s  %s   %s %s", lbl(fFrom, "From knob"), pad(m.from.Value(), 4), lbl(fTo, "To knob"), pad(m.to.Value(), 4),
-		sDim.Render(fmt.Sprintf("(%d %s)", n, knobs)), apply, sDim.Render("enter applies all rows not on keep"))
+	return apply + "  " + sDim.Render("enter applies all rows not on keep")
 }
 
 func (m Model) globalsView() string {
@@ -1042,34 +1039,47 @@ func (m Model) header() string {
 	return h
 }
 
-const help = "tab/⇧tab: grid → from → to → table → apply · grid: arrows move in knob order across banks · ⇧arrows extend range · [ ] 1–8 bank · a whole bank\n" +
-	"table: ↑↓ row · list rows: ←→/space pick value · number rows: ←→ mode/value/step, space cycles mode, digits or -/+ · x row→keep · c all→keep · enter apply\n" +
-	"^r read device · ^w write device · ^o open · ^s save .mfs · ^g globals · q/^q quit"
+// help lines: pairs of key, description.
+var helpLines = [][][2]string{
+	{{"tab/⇧tab", "grid → from → to → table → apply"}, {"arrows", "move in knob order across banks"}, {"⇧arrows", "extend range"}, {"[ ] 1–8", "bank"}, {"a", "whole bank"}},
+	{{"↑↓", "row"}, {"←→/space", "list rows: pick value · number rows: mode/value/step"}, {"space", "cycles mode"}, {"digits -/+", "value"}, {"x", "row→keep"}, {"c", "all→keep"}, {"enter", "apply"}},
+	{{"^r", "read device"}, {"^w", "write device"}, {"^o", "open"}, {"^s", "save .mfs"}, {"^g", "globals"}, {"q/^q", "quit"}},
+}
+
+func helpView() string {
+	var lines []string
+	for _, l := range helpLines {
+		var parts []string
+		for _, kv := range l {
+			parts = append(parts, sKey.Render(kv[0])+" "+sDim.Render(kv[1]))
+		}
+		lines = append(lines, strings.Join(parts, sDim.Render(" · ")))
+	}
+	return strings.Join(lines, "\n")
+}
 
 func (m Model) View() string {
+	status := m.status
+	if m.screen == sConfirm {
+		status = sWarn.Render(m.question)
+	}
 	var body string
 	switch {
 	case m.preset == nil:
-		body = "\n  (no preset)\n"
+		body = "\n  (no preset)\n\n" + status
+	case m.screen == sPicker:
+		return m.header() + "\n\n" + sBox.Render(m.pick.view(m.height))
 	case m.screen == sGlobals:
-		body = sBox.Render(m.globalsView())
+		body = sBox.Render(m.globalsView()) + "\n" + status
 	default:
 		left := lipgloss.JoinVertical(lipgloss.Left, m.bankBar(), m.grid())
-		right := sBox.Render(lipgloss.JoinVertical(lipgloss.Left, m.rangeLine(), "", m.table()))
+		// One line down so the panel's top border lines up with the first knob row.
+		panel := sBox.Render(lipgloss.JoinVertical(lipgloss.Left, m.rangeLine(), "", m.table(), "", m.applyLine()))
+		// Status and questions sit under the panel, wrapped to its width.
+		msg := lipgloss.NewStyle().Width(lipgloss.Width(panel)).PaddingLeft(1).Render(status)
+		right := "\n" + lipgloss.JoinVertical(lipgloss.Left, panel, msg)
 		body = lipgloss.JoinHorizontal(lipgloss.Top, left, "  ", right)
 	}
-	out := m.header() + "\n" + body + "\n"
-	switch m.screen {
-	case sConfirm:
-		out += sWarn.Render(m.question) + "\n"
-	case sPath:
-		verb := "Open"
-		if m.pathSave {
-			verb = "Save as"
-		}
-		out += verb + ": " + m.pathInput.View() + sDim.Render("  (enter / esc)") + "\n"
-	default:
-		out += m.status + "\n"
-	}
-	return out + sDim.Render(help)
+	// The line between body and help stays empty.
+	return m.header() + "\n\n" + body + "\n\n" + helpView()
 }
