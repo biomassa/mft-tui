@@ -84,8 +84,7 @@ func TestMultiRowApply(t *testing.T) {
 		m = press(m, tea.KeyDown)
 	}
 	m.col = cValue
-	m.rows[ind].choice = 2
-	m = press(m, " ") // -> Spread (3), mode becomes same
+	m = press(m, tea.KeyLeft) // keep -> last value, Spread (3); mode becomes same
 	m = press(m, tea.KeyEnter)
 
 	for n := 1; n <= 16; n++ {
@@ -160,18 +159,23 @@ func TestListRowArrowsPickValue(t *testing.T) {
 	if m.col != cValue {
 		t.Fatalf("col %d, want value cell on a list row", m.col)
 	}
-	start := m.rows[at].choice
+	// keep -> Note(0) -> CC(1); left back to Note, left again to keep.
 	m = press(m, tea.KeyRight, tea.KeyRight)
-	if got := m.rows[at].choice; got != (start+2)%7 || m.rows[at].mode != same {
+	if got := m.rows[at].choice; got != 1 || m.rows[at].mode != same {
 		t.Fatalf("choice %d mode %d", got, m.rows[at].mode)
 	}
-	m = press(m, tea.KeyLeft)
-	if got := m.rows[at].choice; got != (start+1)%7 {
-		t.Fatalf("after left: choice %d", got)
+	m = press(m, tea.KeyLeft, tea.KeyLeft)
+	if m.rows[at].mode != keep {
+		t.Fatalf("left past the first value should land on keep, mode %d", m.rows[at].mode)
 	}
-	m = press(m, "x")
-	if m.rows[at].mode != keep || m.rows[at].choice != start {
-		t.Fatal("x did not reset the row")
+	// From keep, left goes to the last value; right from there back to keep.
+	m = press(m, tea.KeyLeft)
+	if got := m.rows[at].choice; got != 6 || m.rows[at].mode != same {
+		t.Fatalf("choice %d mode %d, want last value", got, m.rows[at].mode)
+	}
+	m = press(m, tea.KeyRight)
+	if m.rows[at].mode != keep {
+		t.Fatal("right past the last value should land on keep")
 	}
 }
 

@@ -567,13 +567,13 @@ func (m Model) globalsKey(s string) (tea.Model, tea.Cmd) {
 	switch s {
 	case "esc", "g":
 		m.screen = sMain
-	case "up", "k":
+	case "up":
 		m.globalIdx = (m.globalIdx + n - 1) % n
-	case "down", "j":
+	case "down":
 		m.globalIdx = (m.globalIdx + 1) % n
-	case "left", "h", "-":
+	case "left", "-":
 		delta = -1
-	case "right", "l", "+", "=", " ":
+	case "right", "+", "=", " ":
 		delta = 1
 	case "shift+left":
 		delta = -10
@@ -685,6 +685,24 @@ func (m Model) mainKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// stepList moves a list row through keep, first value … last value, keep, …
+func (m *Model) stepList(forward bool) {
+	r, last := &m.rows[m.row], mft.EncoderFields[m.row].Max()
+	switch {
+	case r.mode == keep && forward:
+		r.mode, r.choice = same, 0
+	case r.mode == keep:
+		r.mode, r.choice = same, last
+	case forward && r.choice == last, !forward && r.choice == 0:
+		r.mode = keep
+		m.prefill(m.firstSelected())
+	case forward:
+		r.choice++
+	default:
+		r.choice--
+	}
+}
+
 func (m *Model) maxCol(i int) int {
 	if !mft.EncoderFields[i].Sequenceable() || m.rows[i].mode != seq {
 		return cValue
@@ -716,47 +734,27 @@ func (m *Model) tableKey(k tea.KeyMsg) {
 	f := mft.EncoderFields[m.row]
 	r := &m.rows[m.row]
 	switch s {
-	case "up", "k":
+	case "up":
 		m.row = max(m.row-1, 0)
 		m.fresh = true
 		m.clampCol()
 		return
-	case "down", "j":
+	case "down":
 		m.row = min(m.row+1, len(m.rows)-1)
 		m.fresh = true
 		m.clampCol()
 		return
-	case "left", "h", "right", "l":
+	case "left", "right":
 		if !f.Sequenceable() { // list rows: arrows pick the value
-			n := f.Max() + 1
-			if s == "left" || s == "h" {
-				r.choice = (r.choice + n - 1) % n
-			} else {
-				r.choice = (r.choice + 1) % n
-			}
-			if r.mode == keep {
-				r.mode = same
-			}
+			m.stepList(s == "right")
 			return
 		}
-		if s == "left" || s == "h" {
+		if s == "left" {
 			m.col = max(m.col-1, cMode)
 		} else {
 			m.col = min(m.col+1, m.maxCol(m.row))
 		}
 		m.fresh = true
-		return
-	case "x":
-		r.mode = keep
-		m.prefill(m.firstSelected())
-		m.clampCol()
-		return
-	case "c":
-		for i := range m.rows {
-			m.rows[i].mode = keep
-		}
-		m.prefill(m.firstSelected())
-		m.clampCol()
 		return
 	}
 	switch m.col {
@@ -787,17 +785,11 @@ func (m *Model) tableKey(k tea.KeyMsg) {
 			}
 			return
 		}
-		n := f.Max() + 1
 		switch s {
 		case " ", "+", "=":
-			r.choice = (r.choice + 1) % n
+			m.stepList(true)
 		case "-":
-			r.choice = (r.choice + n - 1) % n
-		default:
-			return
-		}
-		if r.mode == keep {
-			r.mode = same
+			m.stepList(false)
 		}
 	case cStep:
 		if s == "+" || s == "=" {
@@ -813,7 +805,7 @@ func (m *Model) tableKey(k tea.KeyMsg) {
 func (m *Model) gridKey(s string) {
 	idx := (m.cursor - 1) % 16
 	extend := strings.HasPrefix(s, "shift+")
-	delta := map[string]int{"up": -4, "k": -4, "down": 4, "j": 4, "left": -1, "h": -1, "right": 1, "l": 1}[strings.TrimPrefix(s, "shift+")]
+	delta := map[string]int{"up": -4, "down": 4, "left": -1, "right": 1}[strings.TrimPrefix(s, "shift+")]
 	if delta != 0 {
 		next := m.cursor + delta
 		if next < 1 || next > m.slots() {
@@ -1133,8 +1125,8 @@ func (m Model) header() string {
 
 // help lines: pairs of key, description.
 var helpLines = [][][2]string{
-	{{"tab/⇧tab", "grid → from → to → table → apply"}, {"arrows", "move in knob order across banks"}, {"⇧arrows", "extend range"}, {"[ ] 1–8", "bank"}, {"a", "whole bank"}, {"s", "pick/unpick knob"}},
-	{{"↑↓", "row"}, {"←→/space", "list rows: pick value · number rows: mode/value/step"}, {"space", "cycles mode"}, {"digits -/+", "value"}, {"x", "row→keep"}, {"c", "all→keep"}, {"enter", "apply"}},
+	{{"tab/⇧tab", "grid → from → to → program → apply"}, {"arrows", "move"}, {"⇧arrows", "select range"}, {"[ ] 1–8", "bank"}, {"a", "whole bank"}, {"s", "pick/unpick knob"}},
+	{{"↑↓", "row"}, {"←→/space", "list rows: pick value · number rows: mode/value/step"}, {"space", "cycles mode"}, {"digits -/+", "value"}, {"enter", "apply"}},
 	{{"^r", "read device"}, {"^w", "write device"}, {"^o", "open"}, {"^s", "save .mfs"}, {"^g", "globals"}, {"q/^q", "quit"}},
 }
 
