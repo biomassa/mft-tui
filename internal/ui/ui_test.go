@@ -206,3 +206,26 @@ func TestNumberNudge(t *testing.T) {
 		t.Fatalf("value %s, want %d", m.rows[0].val.Value(), b+1)
 	}
 }
+
+// A device write (and read/open) resets pending rows to keep; Apply does not.
+func TestRowsResetAfterWrite(t *testing.T) {
+	m := load(t, "4bank.mfs")
+	m = press(m, "a")
+	m.rows[9].mode = same // Off Color
+	m.rows[9].val.SetValue("66")
+	m.apply()
+	if m.rows[9].mode != same {
+		t.Fatal("apply reset the row; it should stay for the next range")
+	}
+	out, _ := m.Update(writtenMsg{n: 16})
+	m = out.(Model)
+	if m.rows[9].mode != keep {
+		t.Fatal("row not reset after write")
+	}
+	if v := m.rows[9].val.Value(); v != "66" {
+		t.Fatalf("row not refilled from the written data: %q", v)
+	}
+	if a, b := m.rangeBounds(); a != 1 || b != 16 {
+		t.Fatalf("selection changed: %d–%d", a, b)
+	}
+}

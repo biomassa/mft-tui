@@ -209,6 +209,27 @@ func (m *Model) selectionChanged() {
 	m.prefill(a)
 }
 
+// resetRows puts every row back on keep and refills it from the current data.
+// Called when the data underneath changes: device read, device write, file open.
+// Picks beyond the new knob count are dropped.
+func (m *Model) resetRows() {
+	for i := range m.rows {
+		m.rows[i].mode = keep
+		m.rows[i].step.SetValue("1")
+	}
+	if m.pickMode {
+		var keepPicks []int
+		for _, n := range m.picks {
+			if n <= m.slots() {
+				keepPicks = append(keepPicks, n)
+			}
+		}
+		m.setPicks(keepPicks)
+	}
+	m.clampCol()
+	m.prefill(m.firstSelected())
+}
+
 func (m *Model) prefill(slot int) {
 	if m.preset == nil {
 		return
@@ -371,6 +392,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.info, m.preset, m.base, m.path = msg.info, msg.preset, msg.preset.Clone(), ""
 		m.cursor, m.anchor, m.bank = min(m.cursor, m.slots()), 0, min(m.bank, m.banks()-1)
 		m.selectionChanged()
+		m.resetRows()
 		m.status = fmt.Sprintf("Read %d knobs from %s (firmware %s)", m.slots(), m.dev.Port, m.info.Firmware)
 	case writtenMsg:
 		m.busy = false
@@ -379,6 +401,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.base = m.preset.Clone()
+		m.resetRows()
 		m.status = fmt.Sprintf("Wrote %d knobs + globals to the device", msg.n)
 	case tea.KeyMsg:
 		return m.key(msg)
@@ -528,6 +551,7 @@ func (m Model) finishPick(p string) (tea.Model, tea.Cmd) {
 	addRecent(p)
 	m.cursor, m.anchor, m.bank = 1, 0, 0
 	m.selectionChanged()
+	m.resetRows()
 	m.status = fmt.Sprintf("Opened %s (%d knobs)", filepath.Base(p), pr.Slots())
 	if m.base != nil {
 		m.status += fmt.Sprintf(" · %d knobs differ from the device", len(m.changed()))
