@@ -45,19 +45,51 @@ type picker struct {
 
 func home() string { h, _ := os.UserHomeDir(); return h }
 
-func twisterDir() string { return filepath.Join(home(), "Dropbox", "! modular", "fighter_twister") }
+// FolderFlag is set from the --dir command-line flag; it overrides config.json.
+var FolderFlag string
+
+func configDir() string {
+	d, err := os.UserConfigDir()
+	if err != nil {
+		d = home()
+	}
+	return filepath.Join(d, "mft-tui")
+}
+
+// configuredFolder is the picker's preset folder: --dir, else "folder" in
+// config.json, else "" (not set).
+func configuredFolder() string {
+	if FolderFlag != "" {
+		return FolderFlag
+	}
+	var cfg struct {
+		Folder string `json:"folder"`
+	}
+	if b, err := os.ReadFile(filepath.Join(configDir(), "config.json")); err == nil && json.Unmarshal(b, &cfg) == nil && cfg.Folder != "" {
+		if strings.HasPrefix(cfg.Folder, "~/") {
+			return filepath.Join(home(), cfg.Folder[2:])
+		}
+		return cfg.Folder
+	}
+	return ""
+}
+
+// startFolder is where the picker opens: the configured folder or the current directory.
+func startFolder() string {
+	if f := configuredFolder(); f != "" {
+		return f
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return home()
+}
 
 func profilesDir() string {
 	return filepath.Join(home(), "Library", "Application Support", "DJTechTools", "MFU", "profiles")
 }
 
-func recentFile() string {
-	d, err := os.UserConfigDir()
-	if err != nil {
-		d = home()
-	}
-	return filepath.Join(d, "mft-tui", "recent.json")
-}
+func recentFile() string { return filepath.Join(configDir(), "recent.json") }
 
 func loadRecent() []string {
 	var r []string
@@ -116,7 +148,7 @@ func newPicker(save bool, start, name string) picker {
 		p.name.Focus()
 	}
 	if start == "" {
-		start = twisterDir()
+		start = startFolder()
 	}
 	p.cd(start)
 	return p
@@ -126,8 +158,12 @@ func (p *picker) cd(dir string) {
 	p.dir, p.filter, p.idx, p.err = dir, "", 0, ""
 	p.entries = nil
 	// Places first.
-	p.entries = append(p.entries, entry{kind: ePlace, label: "★ fighter_twister", path: twisterDir()})
-	p.entries = append(p.entries, entry{kind: ePlace, label: "★ Utility 3.0 profiles", path: profilesDir()})
+	if f := configuredFolder(); f != "" {
+		p.entries = append(p.entries, entry{kind: ePlace, label: "★ " + filepath.Base(f), path: f})
+	}
+	if isDir(profilesDir()) {
+		p.entries = append(p.entries, entry{kind: ePlace, label: "★ Utility 3.0 profiles", path: profilesDir()})
+	}
 	for _, r := range loadRecent() {
 		if fi, err := os.Stat(r); err == nil && !fi.IsDir() {
 			p.entries = append(p.entries, entry{kind: ePlace, label: "↺ " + filepath.Base(r), path: r, info: filepath.Dir(r)})

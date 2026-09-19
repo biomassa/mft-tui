@@ -14,6 +14,9 @@ import (
 func load(t *testing.T, file string) Model {
 	t.Helper()
 	p, err := mft.Load("../mft/testdata/" + file)
+	if os.IsNotExist(err) {
+		t.Skipf("testdata/%s not present (presets are not in the repository)", file)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}

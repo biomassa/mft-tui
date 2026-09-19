@@ -1,1 +1,3 @@
 mft-tui
+# Presets used by the tests are the author's device dumps; not published.
+internal/mft/testdata/*.mfs

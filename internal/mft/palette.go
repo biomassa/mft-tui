@@ -1,6 +1,11 @@
-// Code generated from the Twister firmware's colorMap.c (compiled tables,
-// stored there as B,G,R). Personal use only: the firmware licence does not
-// allow redistributing its source.
+// Code generated from colorMap.c in DJ TechTools' Midi Fighter Twister
+// firmware (github.com/DJ-TechTools/Midi_Fighter_Twister_Open_Source), the
+// compiled tables, stored there as B,G,R and converted to RGB here.
+//
+// These tables are DJ TechTools' data, not covered by this repository's MIT
+// licence. The firmware licence restricts redistribution; DJ TechTools'
+// maintainer allowed publishing them in this project:
+// https://forum.djtechtools.com/t/building-a-mft-control-tui-in-go/155183/4
 
 package mft
 

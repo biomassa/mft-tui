@@ -16,9 +16,15 @@ func pickerEnv(t *testing.T) string {
 	t.Setenv("HOME", home)
 	dir := filepath.Join(home, "Dropbox", "! modular", "fighter_twister")
 	os.MkdirAll(filepath.Join(dir, "sub"), 0o755)
-	b, _ := os.ReadFile("../mft/testdata/8bank.mfs")
+	b, err := os.ReadFile("../mft/testdata/8bank.mfs")
+	if os.IsNotExist(err) {
+		t.Skip("testdata/8bank.mfs not present (presets are not in the repository)")
+	}
 	os.WriteFile(filepath.Join(dir, "eight.mfs"), b, 0o644)
 	os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o644)
+	// Point the picker at it the way a user would: config.json.
+	os.MkdirAll(configDir(), 0o755)
+	os.WriteFile(filepath.Join(configDir(), "config.json"), []byte(`{"folder": "`+dir+`"}`), 0o644)
 	return dir
 }
 
@@ -75,5 +81,19 @@ func TestPickerProfilesOpenOnly(t *testing.T) {
 	p := newPicker(true, profilesDir(), "x")
 	if res := p.key(tea.KeyMsg{Type: tea.KeyEnter}); res != nil || !strings.Contains(p.err, "open-only") {
 		t.Fatalf("res %v err %q", res, p.err)
+	}
+}
+
+func TestStartFolderFallsBackToCwd(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no config.json
+	FolderFlag = ""
+	wd, _ := os.Getwd()
+	if got := startFolder(); got != wd {
+		t.Fatalf("start %q, want cwd %q", got, wd)
+	}
+	FolderFlag = "/tmp"
+	defer func() { FolderFlag = "" }()
+	if got := startFolder(); got != "/tmp" {
+		t.Fatalf("flag ignored: %q", got)
 	}
 }
