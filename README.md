@@ -4,6 +4,8 @@ A terminal editor for the DJ TechTools Midi Fighter Twister.
 
 mft-tui changes knob settings on many knobs at once. Select knobs, set the values, and apply them in one step. A setting can get the same value on all knobs or a sequence, for example CC 20, 21, 22 and so on. A selection can cross banks.
 
+This software was developed with the help of a LLM.
+
 ## Features
 
 - Edit all 14 knob settings: encoder and button MIDI number, channel and type, sensitivity, shift channel, colours, indicator, detent, super knob.
@@ -17,7 +19,7 @@ mft-tui changes knob settings on many knobs at once. Select knobs, set the value
 ## Requirements
 
 - A Midi Fighter Twister connected by USB.
-- Go 1.27 or later.
+- Go 1.24.2 or later.
 - A C++ compiler. The MIDI driver (RtMidi) compiles from source. On macOS, install the Xcode Command Line Tools.
 
 The tests were done on macOS with Twister firmware 2026-07-02 (4 banks) and 2026-09-17 (8 banks).
