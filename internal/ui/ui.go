@@ -45,7 +45,7 @@ const (
 	seq              // start + i*step
 )
 
-var modeNames = []string{"keep", "same", "sequence"}
+var modeNames = []string{"keep", "set to", "sequence"}
 
 // Table columns.
 const (
@@ -994,7 +994,7 @@ func (m Model) table() string {
 	sel := m.selected()
 	first := m.firstSelected()
 	var lines []string
-	head := "  " + pad("Setting", 22) + pad("Now", 20) + pad("Mode", 11) + pad("Value", 12) + pad("Step", 7) + "Result"
+	head := "  " + pad("Setting", 22) + pad("Now", 26) + pad("Mode", 11) + pad("Value", 12) + pad("Step", 7) + "Result"
 	lines = append(lines, sDim.Render(head))
 	for i, f := range mft.EncoderFields {
 		r := m.rows[i]
@@ -1040,7 +1040,7 @@ func (m Model) table() string {
 		default:
 			valS = m.cellText(i, cValue, f.Format(r.choice))
 		}
-		lines = append(lines, marker+pad(name, 22)+pad(nowS, 20)+pad(modeS, 11)+pad(valS, 12)+pad(stepS, 7)+result)
+		lines = append(lines, marker+pad(name, 22)+pad(nowS, 26)+pad(modeS, 11)+pad(valS, 12)+pad(stepS, 7)+result)
 	}
 	return strings.Join(lines, "\n")
 }
